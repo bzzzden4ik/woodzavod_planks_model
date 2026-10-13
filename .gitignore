@@ -1,0 +1,52 @@
+# Окружения (создаются заново: см. README.md / labeling/LABELING.md)
+.venv/
+.venv-ls/
+
+# Служебные файлы Python
+__pycache__/
+*.pyc
+
+# Данные: видео, кадры, датасеты — большие, хранятся отдельно от git
+data/
+datasets/
+*.mp4
+*.avi
+*.mkv
+
+# Результаты обучения и веса моделей
+# (models/best.pt тоже не кладём в git: 20+ МБ, хранится отдельно)
+runs/
+*.pt
+*.pth
+*.onnx
+*.part
+openvino_model/
+
+# Результаты обработки видео (measure_boards.py)
+results/
+
+# Скриншоты и графики, присланные после обучения
+outputs/
+
+# Черновые картинки для проверки
+labeling/preview/
+labeling/preview_model/
+labeling/_*.jpg
+
+# Кэш датасета Ultralytics и локальная копия data.yaml (создаёт tools/train.py)
+*.cache
+data_local.yaml
+
+# Логи и секреты
+*.log
+.env
+
+# Редакторы и система
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Архивы для переноса на другой компьютер
+*.zip

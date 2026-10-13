@@ -1,0 +1,7 @@
+<View>
+  <Header value="Обведите контуром каждую доску на конвейере (видимую часть, до края кадра)"/>
+  <Image name="image" value="$image" zoom="true" zoomControl="true" rotateControl="false"/>
+  <PolygonLabels name="board" toName="image" strokeWidth="2" pointSize="small" opacity="0.3">
+    <Label value="доска" background="#00c853"/>
+  </PolygonLabels>
+</View>
