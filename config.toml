@@ -18,8 +18,8 @@ tolerance_percent = 10.0
 # Обученная модель. В git её нет — она лежит в GitHub Releases (см. README.md, раздел 2).
 path = "models/best.pt"
 # Откуда скачать модель, если файла нет. Пусто — не скачивать.
-# Вид ссылки: https://github.com/<владелец>/<репозиторий>/releases/download/<тег>/best.pt
-url = ""
+# Вид ссылки: https://github.com/bzzzden4ik/woodzavod_planks_model/releases/download/<version>/best.pt
+url = "https://github.com/bzzzden4ik/woodzavod_planks_model/releases/download/v1.0.0/best.pt"
 # Контрольная сумма файла модели (SHA-256): так проверяется, что скачался именно он.
 # Пусто — не проверять.
 sha256 = "07a66c1166987c8963bb67925fcf0d31c26a8e0e65eae7b01d0d4783bc7f4e27"
