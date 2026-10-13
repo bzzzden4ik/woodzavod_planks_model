@@ -19,7 +19,7 @@
 Все команды — в PowerShell, из папки `machine_learning`:
 
 ```powershell
-cd путь\к\проекту\machine_learning
+cd путь\к\проекту\woodzavod_planks_model
 py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install --upgrade pip
 ```
@@ -79,7 +79,7 @@ NVIDIA, которую видит PyTorch, — на ней, иначе на пр
   .venv\Scripts\python.exe download_model.py
   ```
 - **Вручную:** открыть на GitHub страницу репозитория → **Releases** → скачать `best.pt` →
-  положить в папку `machine_learning\models\`.
+  положить в папку `woodzavod_planks_model\models\`.
 
 После скачивания программа сверяет **контрольную сумму** файла (`model.sha256` в `config.toml`):
 так видно, что скачалась нужная версия модели, а не другая или испорченная.
