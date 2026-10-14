@@ -20,7 +20,7 @@
 
 ```powershell
 cd путь\к\проекту\woodzavod_planks_model
-python -3.12 -m venv .venv
+python -m venv .venv
 .venv\Scripts\python.exe -m pip install --upgrade pip
 ```
 
