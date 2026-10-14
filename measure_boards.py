@@ -1,23 +1,29 @@
-"""
+r"""
 Подсчёт досок и коротких досок (выбросов) на видео конвейера.
 
 Запуск (из папки machine_learning):
-    .venv\\Scripts\\python.exe measure_boards.py data\\raw\\hiv00000.mp4
-    .venv\\Scripts\\python.exe measure_boards.py data\\sample.mp4 --no-video
-    .venv\\Scripts\\python.exe measure_boards.py видео.mp4 --start 60 --end 360
+    .venv\Scripts\python.exe measure_boards.py data\raw\hiv00000.mp4
+    .venv\Scripts\python.exe measure_boards.py data\sample.mp4 --no-video
+    .venv\Scripts\python.exe measure_boards.py видео.mp4 --start 60 --end 360
 
-Результат — в папке results\\<имя видео>\\:
+Результат — в папке results\<имя видео>\:
     boards.csv     — таблица досок (открывается в Excel)
     summary.json   — итог: сколько досок и выбросов
     annotated.mp4  — видео с разметкой (если не указан --no-video)
 
 Как работает (подробнее — README.md):
   1. Модель ищет доски 5 раз в секунду (models/best.pt).
-  2. Новая доска — длинный объект у входа в станок, который лежит неподвижно.
-  3. Сдвиг доски D (см) считается в каждом кадре по рисунку древесины (tracker.py).
-  4. Правый торец ловится, когда идёт через центр кадра; длина = торец + D - вход в станок
-     (measure.py).
-  5. Доска, которая так и не поехала в станок, не считается.
+  2. Слежение: уверенный объект, правый конец которого двигается только влево (в станок).
+     Новая доска — длинный объект у входа в станок правее всех, за которыми уже следим.
+     Доска засчитывается, когда проехала в станок.
+  3. Длина — по положению доски в начале (когда её положили):
+     - видны оба торца — длина прямо по кадру;
+     - левый торец уже в станке (за краем кадра) — длина известна в пределах
+       [видимая часть; видимая часть + max_hidden_left_cm];
+     - правый торец за правым краем кадра (длинная доска) — правый торец ловится, когда
+       идёт через центр кадра, а сдвиг доски D считается по рисунку древесины (tracker.py).
+  4. Выброс — если длина (или её верхняя граница) <= N * (1 - погрешность). Если по
+     границам решить нельзя — «не измерена».
 """
 
 import argparse
@@ -33,47 +39,78 @@ from PIL import Image, ImageDraw, ImageFont
 
 from detector import BAND_H, BAND_TOP, Detector, describe_device
 from lens import Lens
-from measure import END_CONF, END_ZONE, MIN_LINE_POINTS, AFTER_S, length_from_motion
+from measure import END_CONF, END_ZONE, length_from_motion
 from settings import HERE, load_settings
 from tracker import DisplacementTracker, ProfileSampler
 
-# --- как узнаём новую доску ---
-NEW_MAX_X0 = 300           # левый конец доски у входа в станок (пикс)
-LEFT_OK = (40, 200)        # левый торец в покое должен быть здесь (x, пикс): левее — уже в станке,
-                           # правее — доска ещё не у входа; тогда длину не меряем
-NEW_MIN_WIDTH = 1200       # доска 5 м и длиннее занимает больше 1200 пикс
-NEW_MIN_CONF = 0.7
-STILL_S = 1.5              # доска должна лежать неподвижно столько секунд
-STILL_PX = 25              # «неподвижно» — правый край гуляет не больше чем на столько пикс
-REST_MATCH_PX = 40         # объект в покое — та же доска, если правый край отличается меньше
-NEXT_AFTER_S = 3.0         # новая доска не раньше, чем через 3 с после того, как прошлая поехала
-NEXT_JUMP_PX = 200         # и правее места, где сейчас торец прошлой доски
-FOLLOW_PX = 250            # слежение за доской: правый край сдвинулся не больше чем на столько
-REST_BEFORE_S = 3.0        # точки торца берём не раньше чем за 3 с до конца покоя
-MEASURE_EVERY_S = 1.0      # как часто пробовать посчитать длину
-MOVED_CM = 30.0            # доска «поехала»: сдвиг по рисунку больше 30 см
-MOVED_PX = 300             # или её правый край ушёл влево на 300 пикс
+# --- слежение за досками ---
+TRACK_CONF = 0.65          # слабее — не используем (бывают «призраки» доски от видеокодека)
+TRACK_MIN_WIDTH = 300      # уже — обрезки, куски доски, ушедшей в станок
+MATCH_TOL_PX = 80          # правый край той же доски может «дрогнуть» на столько вправо
+MAX_SPEED_PX = 450         # и уехать влево не быстрее, пикс/с
+LOST_AFTER_S = 8.0         # доску не видно дольше — она ушла (у длинной доски «провал» бывает до 6 с)
+# --- новая доска ---
+NEW_MIN_WIDTH = 800        # новая доска на кадре длиннее 800 пикс (доска 5 м — ~1500)
+NEW_MAX_X0 = 300           # и левым концом у входа в станок или уже в нём
+NEW_RIGHT_OF_PX = 150      # и правее всех досок, за которыми следим (её кладут после)
+# --- когда засчитываем ---
+COUNT_TRAVEL_PX = 400      # правый край уехал влево хотя бы на столько
+COUNT_MIN_DETS = 5         # и доску видели хотя бы в 5 ответах модели (~1 с)
+# --- начало (где доску положили) ---
+START_S = 0.6              # первые 0.6 с слежения
+START_MOVE_PX = 40         # и пока правый край сдвинулся не больше чем на столько
+EDGE_X0 = 20               # левый край контура у края кадра — доска уходит за кадр
+LEFT_SAME = 0.85           # левее контура яркость как у доски — доска продолжается (в станок)
+STILL_S = 1.0              # длинная доска: сдвиг D считаем от момента, когда она пролежала
+STILL_PX = 25              # неподвижно 1 с (правый край гуляет не больше чем на столько пикс)
+FOLLOW_CONF = 0.4          # для рисунка доски годится и неуверенный контур
+FOLLOW_PX = 250            # если его правый край рядом с прошлым (пикс)
+MEASURE_EVERY_S = 1.0      # как часто пересчитывать длину для показа на видео
 
 FONTS = ["C:/Windows/Fonts/arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
 
 
+def left_end_hidden(gray, det):
+    """Левый торец не виден: контур у края кадра, или левее контура доска продолжается
+    (модель не размечает доску за концом роликов). gray — полоса кадра с BAND_TOP."""
+    if det.x0 < EDGE_X0:
+        return True
+    ok = ~np.isnan(det.yc[:80]) & (det.thick[:80] > 10)
+    if ok.sum() < 10 or det.x0 < 60:
+        return False
+    y = int(np.median(det.yc[:80][ok])) - BAND_TOP
+    h = max(int(np.median(det.thick[:80][ok]) / 4), 3)
+    board = np.median(gray[y - h:y + h, det.x0 + 30:det.x0 + 300])
+    left = np.median(gray[y - h:y + h, max(det.x0 - 50, 0):det.x0])
+    return bool(left >= LEFT_SAME * board)
+
+
 @dataclass
 class Board:
-    start_t: float
-    rest_x1: float                       # правый край в покое (пикс)
-    last_rest_t: float
-    last_right: float                    # где правый край сейчас (пикс)
-    rest_y: float                        # высота осевой линии у правого торца в покое (пикс)
-    rest_x0: float                       # левый торец в покое (пикс)
+    first_t: float
+    first_x1: float
+    last_t: float
+    last_x1: float
+    needs_shift: bool                    # правый торец за кадром — нужен сдвиг D
     number: int = 0                      # номер дают, когда доска поехала в станок
-    end_points: list = field(default_factory=list)   # (t, s_торца)
+    max_x1: float = 0.0
+    min_x1: float = 1e9
+    n_dets: int = 0
+    start: list = field(default_factory=list)        # (x0, x1, y_левого, y_правого, левый скрыт)
+    end_points: list = field(default_factory=list)   # (t, s_торца) — для прямой
     tracker: DisplacementTracker = field(default_factory=DisplacementTracker)
+    sampler: ProfileSampler = None
+    last_det: object = None
     result: dict = field(default_factory=dict)
-    length_cm: float | None = None
+    length_cm: float | None = None       # оценка длины
+    length_min: float | None = None      # длина точно не меньше
+    length_max: float | None = None      # и не больше
     method: str = ""
-    moved: bool = False                  # доска поехала в станок
-    done: bool = False                   # длина посчитана, дальше не следим
-    end_t: float = 0.0
+    shift_started: bool = False          # доска легла неподвижно — сдвиг D считаем отсюда
+    shift_done: bool = False             # сдвиг больше не нужен
+    recent: list = field(default_factory=list)       # (t, x1) последних ответов модели
+    follow_x1: float = 0.0               # правый край по любому ответу модели (для рисунка доски)
+    closed: bool = False
     last_try_t: float = -1e9
 
 
@@ -82,121 +119,150 @@ class BoardCounter:
         self.st = st
         self.lens = lens
         self.p_left = float(lens.s(st.machine_entry_x, st.machine_entry_y))   # вход в станок, см
-        self.sampler = ProfileSampler(lens, y_offset=BAND_TOP)
-        self.boards = []                 # подтверждённые доски
-        self.unfinished = []             # не успели доехать до конца видео
+        self.all = []                    # все объекты, за которыми следили
+        self.boards = []                 # засчитанные доски (по порядку номеров)
+        self.unfinished = []             # видео кончилось раньше, чем доска поехала
         self.dropped = 0                 # объекты, которые не поехали в станок
-        self.cur = None
-        self.cur_det = None
-        self.still = []                  # (t, x1) кандидата в новую доску
+
+    def active(self, t):
+        return [b for b in self.all if not b.closed]
 
     # --- ответы модели (каждый N-й кадр) ---
-    def on_detections(self, t, dets):
-        self._check_new_board(t, dets)
-        cur = self.cur
-        self.cur_det = None
-        if cur is None:
-            self.sampler.ready = None
-            return
-        near = [d for d in dets if d.conf >= 0.4 and d.x0 < 400 and d.width > 800
-                and abs(d.x1 - cur.last_right) < FOLLOW_PX]
+    def on_detections(self, t, dets, gray):
+        for b in self.active(t):
+            b.last_det = None
+        cands = sorted([d for d in dets if d.conf >= TRACK_CONF and d.width >= TRACK_MIN_WIDTH],
+                       key=lambda d: -d.x1)
+        used = set()
+        for d in cands:
+            best = None
+            for b in self.active(t):
+                if id(b) in used:
+                    continue
+                lo = b.last_x1 - (t - b.last_t) * MAX_SPEED_PX - MATCH_TOL_PX
+                if lo <= d.x1 <= b.last_x1 + MATCH_TOL_PX and (
+                        best is None or abs(d.x1 - b.last_x1) < abs(d.x1 - best.last_x1)):
+                    best = b
+            if best is None:
+                right_of = max([b.last_x1 for b in self.active(t)], default=-1e9)
+                if d.width >= NEW_MIN_WIDTH and d.x0 < NEW_MAX_X0 and d.x1 > right_of + NEW_RIGHT_OF_PX:
+                    best = Board(first_t=t, first_x1=d.x1, last_t=t, last_x1=d.x1,
+                                 needs_shift=d.x1 >= END_ZONE[1],
+                                 sampler=ProfileSampler(self.lens, y_offset=BAND_TOP))
+                    self.all.append(best)
+                else:
+                    continue
+            used.add(id(best))
+            self._update(best, t, d, gray)
+        for b in self.active(t):
+            if b.needs_shift and b.shift_started and not b.shift_done:
+                self._follow(b, dets)
+            if t - b.last_t > LOST_AFTER_S:
+                self._close(b, t)
+
+    def _follow(self, b, dets):
+        """Контур для рисунка доски: любой ответ модели рядом с ней, даже неуверенный.
+        Уверенный контур на длинной доске пропадает на секунды, а доска за это время уезжает."""
+        near = [d for d in dets if d.conf >= FOLLOW_CONF and d.x0 < 400 and d.width > 800
+                and abs(d.x1 - b.follow_x1) < FOLLOW_PX]
         if near:
-            self.cur_det = min(near, key=lambda d: abs(d.x1 - cur.last_right))
-            cur.last_right = self.cur_det.x1
-            if cur.last_right < cur.rest_x1 - MOVED_PX:
-                cur.moved = True
-            self.sampler.prepare(self.cur_det)
+            d = min(near, key=lambda d: abs(d.x1 - b.follow_x1))
+            b.follow_x1 = d.x1
+            b.sampler.prepare(d)
         else:
-            self.sampler.ready = None
-        if cur.done:
-            return
-        for d in dets:
-            if d.conf >= END_CONF and END_ZONE[0] < d.x1 < END_ZONE[1]:
-                cur.end_points.append((t, float(self.lens.s(d.x1, d.y_at_right()))))
-        if t - cur.last_try_t >= MEASURE_EVERY_S:
-            cur.last_try_t = t
-            self._try_measure(cur, t)
+            b.sampler.ready = None
 
-    def _check_new_board(self, t, dets):
-        cands = [d for d in dets if d.x0 < NEW_MAX_X0 and d.width > NEW_MIN_WIDTH and d.conf > NEW_MIN_CONF]
-        best = max(cands, key=lambda d: d.x1) if cands else None
-        self.still.append((t, best.x1 if best else None, best.x0 if best else None))
-        self.still = [p for p in self.still if p[0] > t - STILL_S - 0.01]
-        xs = [p[1] for p in self.still]
-        if None in xs or self.still[-1][0] - self.still[0][0] < STILL_S - 0.25 or max(xs) - min(xs) > STILL_PX:
-            return
-        x1 = float(np.median(xs))
-        cur = self.cur
-        if cur is not None and not cur.moved and abs(x1 - cur.rest_x1) < REST_MATCH_PX:
-            cur.last_rest_t = t                      # прежняя доска всё ещё лежит
-            return
-        # у всех досок 10 м правый край в покое на одном месте, поэтому новую доску
-        # отличаем так: прежняя уже поехала, и новая лежит правее её торца
-        if cur is None or (cur.moved and t - cur.last_rest_t > NEXT_AFTER_S
-                           and x1 > cur.last_right + NEXT_JUMP_PX):
-            if cur is not None:
-                self._finish(cur, t)
-            self.cur = Board(start_t=self.still[0][0], rest_x1=x1, last_rest_t=t, last_right=x1,
-                             rest_y=best.y_at_right(), rest_x0=float(np.median([p[2] for p in self.still])))
-
-    # --- каждый кадр ---
-    def on_frame(self, t, gray):
-        cur = self.cur
-        if cur is not None and not cur.done:
-            cur.tracker.add(t, self.sampler.sample(gray))
-            if cur.tracker.D > MOVED_CM:
-                cur.moved = True
-
-    # --- длина ---
-    def _try_measure(self, b, t, final=False):
-        if final:
-            b.tracker.finish_rest()
-        pts = [p for p in b.end_points if p[0] >= b.last_rest_t - REST_BEFORE_S]
-        r = length_from_motion(pts, b.tracker.history, self.p_left)
-        b.result = r
-        if r["n_line"] >= MIN_LINE_POINTS and not b.number:
+    def _update(self, b, t, d, gray):
+        b.last_t, b.last_x1, b.last_det = t, d.x1, d
+        b.max_x1, b.min_x1 = max(b.max_x1, d.x1), min(b.min_x1, d.x1)
+        b.n_dets += 1
+        if b.needs_shift and not b.shift_started:
+            # длинная доска: начало — когда она легла неподвижно (раньше её ещё двигают руками)
+            b.recent = [(tt, x) for tt, x in b.recent if tt > t - STILL_S] + [(t, d.x1)]
+            xs = [x for _, x in b.recent]
+            if t - b.recent[0][0] >= STILL_S - 0.25 and max(xs) - min(xs) <= STILL_PX:
+                b.shift_started = True
+                b.first_t, b.first_x1, b.start = t, d.x1, []
+                b.follow_x1 = d.x1
+        if (b.shift_started or not b.needs_shift) and t <= b.first_t + START_S                 and d.x1 >= b.first_x1 - START_MOVE_PX:
+            b.start.append((d.x0, d.x1, float(np.nanmedian(d.yc[:15])), d.y_at_right(),
+                            left_end_hidden(gray, d)))
+        if END_ZONE[0] < d.x1 < END_ZONE[1]:
+            b.end_points.append((t, float(self.lens.s(d.x1, d.y_at_right()))))
+        if not b.number and b.max_x1 - b.min_x1 >= COUNT_TRAVEL_PX and b.n_dets >= COUNT_MIN_DETS:
             b.number = len(self.boards) + 1          # поехала в станок — это доска
             self.boards.append(b)
-        if not LEFT_OK[0] <= b.rest_x0 <= LEFT_OK[1]:
-            if final or (r["line_start"] is not None and t >= r["line_start"] + AFTER_S):
-                where = "уже в станке" if b.rest_x0 < LEFT_OK[0] else "не у входа в станок"
-                b.method = f"левый торец в покое {where} (x={b.rest_x0:.0f})"
-                b.done = True
-            return
-        if r["length_cm"] is not None and (final or t >= r["line_start"] + AFTER_S):
-            b.length_cm = r["length_cm"] + self.st.length_correction_cm
-            b.method = "движение: торец + сдвиг"
-            b.done = True
-        elif final and b.number and END_ZONE[0] < b.rest_x1 < END_ZONE[1]:
-            # короткая доска: правый торец был виден, пока она лежала
-            b.length_cm = float(self.lens.s(b.rest_x1, b.rest_y)) - self.p_left + self.st.length_correction_cm
-            b.method = "в покое: торец виден"
-            b.done = True
+        if b.number and t - b.last_try_t >= MEASURE_EVERY_S:
+            b.last_try_t = t
+            self._measure(b)
 
-    def _finish(self, b, t, end_of_video=False):
-        if not b.done:
-            self._try_measure(b, t, final=True)
-        if b.number and b.length_cm is None and not b.method:
-            b.method = ("видео закончилось раньше, чем торец прошёл центр кадра" if end_of_video
-                        else "мало данных: торец и сдвиг доски не удалось связать")
-        b.end_t = t
-        if not b.number:
-            if end_of_video:
-                self.unfinished.append(b)
+    # --- каждый кадр: сдвиг длинных досок ---
+    def on_frame(self, t, gray):
+        for b in self.active(t):
+            if b.needs_shift and b.shift_started and not b.shift_done:
+                b.tracker.add(t, b.sampler.sample(gray))
+
+    # --- длина ---
+    def _measure(self, b, final=False):
+        if not b.start:
+            b.method = "нет уверенных кадров в начале"
+            return
+        st = np.array(b.start, float)
+        x0, x1, yl, yr = (float(np.median(st[:, i])) for i in range(4))
+        hidden = st[:, 4].mean() >= 0.5
+        s_edge = float(self.lens.s(0, yl))                      # левый край кадра, см
+        H = self.st.max_hidden_left_cm
+        corr = self.st.length_correction_cm
+        if not b.needs_shift:                                   # правый торец виден сразу
+            p_right = float(self.lens.s(x1, yr))
+            if not hidden:
+                L = p_right - float(self.lens.s(x0, yl)) + corr
+                b.length_cm = b.length_min = b.length_max = L
+                b.method = "оба торца в кадре"
             else:
-                self.dropped += 1
-                print(f"  {fmt_t(b.start_t)}: объект не поехал в станок — не считается")
+                lo = p_right - s_edge + corr
+                b.length_min, b.length_max, b.length_cm = lo, lo + H, lo
+                b.method = "левый торец в станке: длина в пределах"
+        else:                                                   # длинная: торец + сдвиг
+            if final:
+                b.tracker.finish_rest()
+            r = length_from_motion(b.end_points, b.tracker.history, s_edge if hidden else self.p_left)
+            b.result = r
+            if r["length_cm"] is None:
+                if final:
+                    b.method = "мало данных: торец и сдвиг доски не удалось связать"
+                return
+            L = r["length_cm"] + corr
+            if not hidden:
+                b.length_cm = b.length_min = b.length_max = L
+                b.method = "движение: торец + сдвиг"
+            else:
+                b.length_min, b.length_max, b.length_cm = L, L + H, L
+                b.method = "движение, левый торец в станке: длина в пределах"
+            if b.end_points and b.end_points[-1][0] > r["line_start"] + 1.0:
+                b.shift_done = True                             # дальше сдвиг не нужен
+
+    def _close(self, b, t, end_of_video=False):
+        b.closed = True
+        if b.number:
+            self._measure(b, final=True)
+        elif end_of_video and b.n_dets >= COUNT_MIN_DETS:
+            self.unfinished.append(b)
+        else:
+            self.dropped += 1
 
     def close(self, t):
-        if self.cur is not None:
-            self._finish(self.cur, t, end_of_video=True)
-            self.cur = None
+        for b in self.active(t):
+            self._close(b, t, end_of_video=True)
 
     # --- итог ---
     def status(self, b):
-        if b.length_cm is None:
-            return "не измерена"
-        return "выброс" if b.length_cm <= self.st.outlier_limit_cm else "норма"
+        limit = self.st.outlier_limit_cm
+        if b.length_max is not None and b.length_max <= limit:
+            return "выброс"
+        if b.length_min is not None and b.length_min > limit:
+            return "норма"
+        return "не измерена"
 
     def counts(self):
         st = [self.status(b) for b in self.boards]
@@ -205,6 +271,14 @@ class BoardCounter:
 
 def fmt_t(t):
     return f"{int(t // 3600)}:{int(t % 3600 // 60):02d}:{t % 60:04.1f}" if t >= 3600 else f"{int(t // 60)}:{t % 60:04.1f}"
+
+
+def fmt_len(b):
+    if b.length_min is None:
+        return "?"
+    if b.length_max - b.length_min < 1:
+        return f"{b.length_cm:.0f}"
+    return f"{b.length_min:.0f}–{b.length_max:.0f}"
 
 
 class Overlay:
@@ -225,46 +299,43 @@ class Overlay:
     def draw(self, frame, t, dets, counter):
         s = self.scale
         img = cv2.resize(frame, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-        cur, cur_det, limit = counter.cur, counter.cur_det, counter.st.outlier_limit_cm
+        tracked = {id(b.last_det): b for b in counter.active(t) if b.last_det is not None}
+        labels = []
         for d in dets or []:
-            if d is cur_det:
+            b = tracked.get(id(d))
+            if b is None:
+                cv2.polylines(img, [(d.contour * s).astype(np.int32)], True, (150, 150, 150), 1)
                 continue
-            color = (0, 200, 0) if d.conf >= END_CONF else (150, 150, 150)
-            cv2.polylines(img, [(d.contour * s).astype(np.int32)], True, color, 1)
-        label = None
-        if cur is not None and cur_det is not None:
-            color = (0, 220, 255)                                     # жёлтая — измеряется
-            if cur.length_cm is not None:
-                color = (0, 0, 255) if cur.length_cm <= limit else (0, 220, 0)
-            cv2.polylines(img, [(cur_det.contour * s).astype(np.int32)], True, color, 3)
-            if not cur.number:
-                text = "Новая доска: ждём, поедет ли в станок"
-            elif cur.length_cm is None:
-                text = f"Доска №{cur.number}: измеряется..."
+            st = counter.status(b) if b.number else ""
+            color = {"выброс": (0, 0, 255), "норма": (0, 220, 0)}.get(st, (0, 220, 255))
+            cv2.polylines(img, [(d.contour * s).astype(np.int32)], True, color, 3)
+            if not b.number:
+                text = "Новая доска: засчитаю, когда поедет в станок"
+            elif b.length_min is None:
+                text = f"№{b.number}: измеряется..."
             else:
-                text = f"Доска №{cur.number}: {cur.length_cm:.0f} см ({counter.status(cur)})"
-            ys = cur_det.contour[:, 0, 1]
-            label = (int(cur_det.x0 * s) + 20, int(ys.min() * s) - 34, text)
+                text = f"№{b.number}: {fmt_len(b)} см ({st})"
+            labels.append((int(d.x0 * s) + 20, int(d.contour[:, 0, 1].min() * s) - 34, text))
 
         pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         dr = ImageDraw.Draw(pil, "RGBA")
         c = counter.counts()
+        limit = counter.st.outlier_limit_cm
         lines = [f"Время видео: {fmt_t(t)}",
                  f"Досок: {c['boards']}   Выбросов: {c['outliers']}   Не измерено: {c['not_measured']}",
                  f"N = {counter.st.normal_length_cm:.0f} см, выброс если ≤ {limit:.0f} см"]
-        last = [b for b in counter.boards if b.length_cm is not None][-3:]
+        last = [b for b in counter.boards if b.length_min is not None][-3:]
         if last:
-            lines.append("Последние: " + ", ".join(f"№{b.number} {b.length_cm:.0f}" for b in last))
+            lines.append("Последние: " + ", ".join(f"№{b.number} {fmt_len(b)}" for b in last))
         dr.rectangle((8, 8, 640, 16 + 30 * len(lines)), fill=(0, 0, 0, 160))
         for i, line in enumerate(lines):
             dr.text((16, 14 + 30 * i), line, font=self.font, fill=(255, 255, 255))
-        if label:
-            x, y, text = label
+        for x, y, text in labels:
             y = max(y, 16 + 30 * len(lines) + 4)
             dr.rectangle((x - 4, y - 2, x + 12 * len(text), y + 26), fill=(0, 0, 0, 160))
             dr.text((x, y), text, font=self.font, fill=(255, 255, 0))
         dr.text((16, pil.height - 28), "Жёлтый контур — доска измеряется, зелёный — норма, красный — выброс, "
-                "тонкий — другие ответы модели", font=self.small, fill=(255, 255, 255))
+                "серый — не доска или неуверенный ответ модели", font=self.small, fill=(255, 255, 255))
         return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
 
@@ -309,10 +380,11 @@ def analyze_video(video, out_dir, write_video=True, start_s=0.0, end_s=None, sca
         t = k / fps
         if end_s is not None and t > end_s:
             break
+        gray = cv2.cvtColor(frame[BAND_TOP:BAND_TOP + BAND_H], cv2.COLOR_BGR2GRAY)
         if (k - k_first) % st.every_n_frames == 0:
             dets = detector(frame)
-            counter.on_detections(t, dets)
-        counter.on_frame(t, cv2.cvtColor(frame[BAND_TOP:BAND_TOP + BAND_H], cv2.COLOR_BGR2GRAY))
+            counter.on_detections(t, dets, gray)
+        counter.on_frame(t, gray)
         if write_video:
             if writer is None:
                 h, w = frame.shape[:2]
@@ -332,14 +404,15 @@ def analyze_video(video, out_dir, write_video=True, start_s=0.0, end_s=None, sca
 
     with open(out_dir / "boards.csv", "w", newline="", encoding="utf-8-sig") as f:
         wr = csv.writer(f, delimiter=";")
-        wr.writerow(["номер", "появилась", "появилась_с", "длина_см", "статус", "как_измерена",
-                     "точек_торца", "кадров_торец_и_сдвиг", "скорость_см_с"])
+        wr.writerow(["номер", "появилась", "появилась_с", "длина_см", "длина_мин_см", "длина_макс_см",
+                     "статус", "как_измерена", "точек_торца", "кадров_торец_и_сдвиг", "скорость_см_с"])
+        r0 = lambda v: "" if v is None else f"{v:.0f}"
         for b in counter.boards + counter.unfinished:
             r = b.result or {}
-            wr.writerow([b.number or "", fmt_t(b.start_t), f"{b.start_t:.1f}",
-                         "" if b.length_cm is None else f"{b.length_cm:.0f}",
+            wr.writerow([b.number or "", fmt_t(b.first_t), f"{b.first_t:.1f}",
+                         r0(b.length_cm), r0(b.length_min), r0(b.length_max),
                          counter.status(b) if b.number else "не завершена (конец видео)",
-                         b.method, r.get("n_line", 0), r.get("n_overlap", 0),
+                         b.method, r.get("n_line", len(b.end_points)), r.get("n_overlap", ""),
                          "" if r.get("speed") is None else f"{-r['speed']:.1f}"])
     summary = dict(video=str(video), **counter.counts(), unfinished=len(counter.unfinished),
                    dropped_objects=counter.dropped, normal_length_cm=st.normal_length_cm,
@@ -373,7 +446,7 @@ def main():
     print(f"Досок: {s['boards']}, выбросов (≤ {s['outlier_limit_cm']:.0f} см): {s['outliers']}, "
           f"не измерено: {s['not_measured']}")
     if s["unfinished"]:
-        print(f"Не доехали до конца видео (не считаются): {s['unfinished']}")
+        print(f"Не поехали в станок до конца видео (не считаются): {s['unfinished']}")
     print(f"Таблица: {out / 'boards.csv'}")
     if not args.no_video:
         print(f"Видео:   {out / 'annotated.mp4'}")

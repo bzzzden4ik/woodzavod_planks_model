@@ -26,6 +26,7 @@ class Settings:
     machine_entry_x: float
     machine_entry_y: float
     length_correction_cm: float
+    max_hidden_left_cm: float
 
     @property
     def outlier_limit_cm(self) -> float:
@@ -67,6 +68,7 @@ def load_settings(path: Path = HERE / "config.toml") -> Settings:
         machine_entry_x=float(d["geometry"]["machine_entry_x"]),
         machine_entry_y=float(d["geometry"]["machine_entry_y"]),
         length_correction_cm=float(d["geometry"]["length_correction_cm"]),
+        max_hidden_left_cm=float(d["geometry"].get("max_hidden_left_cm", 150.0)),
     )
 
 
